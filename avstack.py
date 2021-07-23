@@ -47,192 +47,229 @@
 # as the stack cost of "main", plus the maximum stack cost of any
 # interrupt handler which might execute.
 
+#
+# If you want to manually add edges that are not automatically detected due to
+# the use of function pointers, make a second dummy function containing calls to
+# the real functions. Prefix its name with `__stack_check_dummy__` and it will
+# be picked up.
+#
+# For example, if you have a function:
+#   int test(void) {
+#      return some_function_pointer();
+#   }
+#
+# ... and you know that some_function_pointer always points to real_func,
+# create the dummy function:
+#   void __stack_check_dummy__test(void) {
+#       real_func();
+#   }
+#
+# This function will be optimised out by the compiler as it is never called,
+# but will exist in the intermediate .o file and thus be picked up by avstack.
+
 import sys
 import subprocess
 import re
 import os
 
-# Configuration: set these as appropriate for your architecture/project.
+def calculate_stack(object_file_paths, objdump='arm-none-eabi-objdump',
+        call_cost=4, log_ambiguous=True, function_whitelist=None):
+    # First, we need to read all object and corresponding .su files. We're
+    # gathering a mapping of functions to callees and functions to frame
+    # sizes. We're just parsing at this stage -- callee name resolution
+    # comes later.
 
-objdump = "arm-none-eabi-objdump"
-call_cost = 4
+    frame_size = {}     # "func@file" -> size
+    call_graph = {}     # "func@file" -> {callees}
+    addresses  = {}     # "addr@file" -> "func@file"
 
-# First, we need to read all object and corresponding .su files. We're
-# gathering a mapping of functions to callees and functions to frame
-# sizes. We're just parsing at this stage -- callee name resolution
-# comes later.
+    global_name = {}    # "func" -> "func@file"
+    ambiguous   = set() # "func" -> 1
 
-frame_size = {}     # "func@file" -> size
-call_graph = {}     # "func@file" -> {callees}
-addresses  = {}     # "addr@file" -> "func@file"
+    for objfile in object_file_paths:
+        # Disassemble this object file to obtain a callees. Sources in the
+        # call graph are named "func@file". Targets in the call graph are
+        # named either "offset@file" or "funcname". We also keep a list of
+        # the addresses and names of each function we encounter.
+        ran = subprocess.run([objdump, '-dr', objfile], capture_output=True, check=True)
 
-global_name = {}    # "func" -> "func@file"
-ambiguous   = set() # "func" -> 1
+        for line in ran.stdout.decode().split('\n'):
+            line = line.strip()
 
-for objfile in sys.argv[1:]:
-    # Disassemble this object file to obtain a callees. Sources in the
-    # call graph are named "func@file". Targets in the call graph are
-    # named either "offset@file" or "funcname". We also keep a list of
-    # the addresses and names of each function we encounter.
-    ran = subprocess.run([objdump, '-dr', objfile], capture_output=True, check=True)
+            match = re.search(r'^([0-9a-fA-F]+) <(.*)>:', line)
+            if match:
+                a, name = match.groups()
 
-    for line in ran.stdout.decode().split('\n'):
-        line = line.strip()
+                is_dummy = False
+                if name.startswith('__stack_check_dummy__'):
+                    is_dummy = True
+                    name = name[len('__stack_check_dummy__'):]
 
-        match = re.search(r'^([0-9a-fA-F]+) <(.*)>:', line)
-        if match:
-            a, name = match.groups()
+                source = f"{name}@{objfile}"
 
-            source = f"{name}@{objfile}"
-            call_graph[source] = set()
-            if name in global_name:
-                ambiguous.add(name)
-            global_name[name] = source
+                if function_whitelist is None or name in function_whitelist:
+                    if source not in call_graph:
+                        call_graph[source] = set()
+                    if name in global_name and not is_dummy:
+                        ambiguous.add(name)
+                    global_name[name] = source
 
-            a = a.lstrip('0')
-            addresses[f"{a}@{objfile}"] = source
+                    if not is_dummy:
+                        a = a.lstrip('0')
+                        addresses[f"{a}@{objfile}"] = source
 
-        match = re.search(r': R_[A-Za-z0-9_]+_CALL[ \t]+(.*)', line)
-        if match:
-            t = match.group(1)
+            match = re.search(r': R_[A-Za-z0-9_]+_CALL[ \t]+(.*)', line)
+            if match:
+                t = match.group(1)
 
-            if t == ".text":
-                t = f"@{objfile}"
+                if t == ".text":
+                    t = f"@{objfile}"
+                else:
+                    match = re.search(r'^\.text\+0x(.*)$', t)
+                    if match:
+                        t = f"{match.group(1)}@{objfile}"
+
+                if function_whitelist is None or name in function_whitelist:
+                    call_graph[source].add(t)
+
+        # Extract frame sizes from the corresponding .su file.
+        base, ext = os.path.splitext(objfile)
+        if ext == '.o':
+            sufile = f"{base}.su"
+
+            with open(sufile, 'r') as f:
+                for line in f.readlines():
+                    match = re.search(r'^.*:([^\t ]+)[ \t]+([0-9]+)', line)
+                    if match:
+                        name, size = match.groups()
+                        size = int(size)
+                        frame_size[f"{name}@{objfile}"] = size + call_cost
+
+    # In this step, we enumerate each list of callees in the call graph and
+    # try to resolve the symbols. We omit ones we can't resolve, but keep a
+    # set of them anyway.
+
+    unresolved = set()
+
+    for _from, callees in call_graph.items():
+        resolved = set()
+
+        for t in callees:
+            if t in addresses:
+                resolved.add(addresses[t])
+            elif t in global_name:
+                resolved.add(global_name[t])
+                if t in ambiguous and log_ambiguous:
+                    print(f"Ambiguous resolution: {t}", file=sys.stderr)
+            elif t in call_graph:
+                resolved.add(t)
             else:
-                match = re.search(r'^\.text\+0x(.*)$', t)
-                if match:
-                    t = f"{match.group(1)}@{objfile}"
+                unresolved.add(t)
 
-            call_graph[source].add(t)
+        call_graph[_from] = resolved
 
-    # Extract frame sizes from the corresponding .su file.
-    base, ext = os.path.splitext(objfile)
-    if ext == '.o':
-        sufile = f"{base}.su"
+    # Create fake edges and nodes to account for dynamic behaviour.
+    call_graph["INTERRUPT"] = set()
 
-        with open(sufile, 'r') as f:
-            for line in f.readlines():
-                match = re.search(r'^.*:([^\t ]+)[ \t]+([0-9]+)', line)
-                if match:
-                    name, size = match.groups()
-                    size = int(size)
-                    frame_size[f"{name}@{objfile}"] = size + call_cost
+    for t in call_graph.keys():
+        if t.startswith('__vector_'):
+            call_graph["INTERRUPT"].add(t)
 
-# In this step, we enumerate each list of callees in the call graph and
-# try to resolve the symbols. We omit ones we can't resolve, but keep a
-# set of them anyway.
+    # Trace the call graph and calculate, for each function:
+    #
+    #    - inherited frames: maximum inherited frame of callees, plus own
+    #      frame size.
+    #    - height: maximum height of callees, plus one.
+    #    - recursion: is the function called recursively (including indirect
+    #      recursion)?
 
-unresolved = set()
+    has_caller = set()
+    visited = {}
+    total_cost = {}
+    call_depth = {}
 
-for _from, callees in call_graph.items():
-    resolved = set()
+    def trace(f):
+        if f in visited:
+            if visited[f] == '?':
+                visited[f] = 'R'
+            return
 
-    for t in callees:
-        if t in addresses:
-            resolved.add(addresses[t])
-        elif t in global_name:
-            resolved.add(global_name[t])
-            if t in ambiguous:
-                print(f"Ambiguous resolution: {t}", file=sys.stderr)
-        elif t in call_graph:
-            resolved.add(t)
-        else:
-            unresolved.add(t)
+        visited[f] = "?"
 
-    call_graph[_from] = resolved
+        max_depth = 0
+        max_frame = 0
 
-# Create fake edges and nodes to account for dynamic behaviour.
-call_graph["INTERRUPT"] = set()
+        for t in call_graph[f]:
+            has_caller.add(t)
+            trace(t)
 
-for t in call_graph.keys():
-    if t.startswith('__vector_'):
-        call_graph["INTERRUPT"].add(t)
+            _is = total_cost[t]
+            d = call_depth[t]
 
-# Trace the call graph and calculate, for each function:
-#
-#    - inherited frames: maximum inherited frame of callees, plus own
-#      frame size.
-#    - height: maximum height of callees, plus one.
-#    - recursion: is the function called recursively (including indirect
-#      recursion)?
+            max_frame = max(_is, max_frame)
+            max_depth = max(d, max_depth)
 
-has_caller = set()
-visited = {}
-total_cost = {}
-call_depth = {}
+        call_depth[f] = max_depth + 1
+        total_cost[f] = max_frame + frame_size.get(f, 0)
 
-def trace(f):
-    if f in visited:
-        if visited[f] == '?':
-            visited[f] = 'R'
-        return
+        if visited[f] == "?":
+            visited[f] = " "
 
-    visited[f] = "?"
+    for key in call_graph.keys():
+        trace(key)
 
-    max_depth = 0
-    max_frame = 0
+    return (total_cost, frame_size, call_depth, visited, has_caller,
+        global_name, ambiguous, unresolved)
 
-    for t in call_graph[f]:
-        has_caller.add(t)
-        trace(t)
+def pretty_print_results(total_cost, frame_size, call_depth, visited, has_caller,
+        global_name, ambiguous, unresolved):
+    # Now, print results in a nice table.
+    print("  %-30s %8s %8s %8s" % (
+        "Func", "Cost", "Frame", "Height"))
+    print("------------------------------------------------------------------------")
 
-        _is = total_cost[t]
-        d = call_depth[t]
+    max_iv = 0
+    main = 0
 
-        max_frame = max(_is, max_frame)
-        max_depth = max(d, max_depth)
-
-    call_depth[f] = max_depth + 1
-    total_cost[f] = max_frame + frame_size.get(f, 0)
-
-    if visited[f] == "?":
-        visited[f] = " "
-
-for key in call_graph.keys():
-    trace(key)
-
-# Now, print results in a nice table.
-print("  %-30s %8s %8s %8s" % (
-    "Func", "Cost", "Frame", "Height"))
-print("------------------------------------------------------------------------")
-
-max_iv = 0
-main = 0
-
-sorted_funcs = sorted(visited.keys(), key=lambda x: total_cost[x], reverse=True)
-for func in sorted_funcs:
-    name = func
-
-    match = re.search(r'^(.*)@(.*)$', func)
-    if match:
-        name = match.group(1)
-
-    tag = visited[func]
-    cost = total_cost[func]
-
-    if name in ambiguous:
+    sorted_funcs = sorted(visited.keys(), key=lambda x: total_cost[x], reverse=True)
+    for func in sorted_funcs:
         name = func
-    tag = ' ' if func in has_caller else '>'
 
-    if func.startswith('__vector_'):
-        max_iv = max(cost, max_iv)
-    elif func.startswith('main@'):
-        main = cost
+        match = re.search(r'^(.*)@(.*)$', func)
+        if match:
+            name = match.group(1)
 
-    print("%s %-30s %8d %8d %8d" % (tag, name, cost,
-        frame_size.get(func, 0), call_depth[func]))
+        tag = visited[func]
+        cost = total_cost[func]
 
-print("")
+        if name in ambiguous:
+            name = func
+        tag = ' ' if func in has_caller else '>'
 
-main_cost = total_cost.get(global_name.get("main"), 0)
-iv_cost = total_cost["INTERRUPT"]
+        if func.startswith('__vector_'):
+            max_iv = max(cost, max_iv)
+        elif func.startswith('main@'):
+            main = cost
 
-print("Peak execution estimate (main + worst-case IV):")
-print("  main = %d, worst IV = %d, total = %d\n" % (
-      main_cost,
-      iv_cost,
-      main_cost + iv_cost))
+        print("%s %-30s %8d %8d %8d" % (tag, name, cost,
+            frame_size.get(func, 0), call_depth[func]))
 
-print("The following functions were not resolved:")
-for f in unresolved:
-    print(f"  {f}")
+    print("")
+
+    main_cost = total_cost.get(global_name.get("main"), 0)
+    iv_cost = total_cost["INTERRUPT"]
+
+    print("Peak execution estimate (main + worst-case IV):")
+    print("  main = %d, worst IV = %d, total = %d\n" % (
+        main_cost,
+        iv_cost,
+        main_cost + iv_cost))
+
+    print("The following functions were not resolved:")
+    for f in unresolved:
+        print(f"  {f}")
+
+
+if __name__ == '__main__':
+    pretty_print_results(*calculate_stack(sys.argv[1:]))
+
